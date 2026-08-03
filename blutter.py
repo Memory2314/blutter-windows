@@ -48,18 +48,29 @@ class BlutterInput:
 
 
 def find_lib_files(indir: str):
+    # Android (upstream)
     app_file = os.path.join(indir, 'libapp.so')
     if not os.path.isfile(app_file):
         app_file = os.path.join(indir, 'App')
-        if not os.path.isfile(app_file):
-            sys.exit("Cannot find libapp file")
-    
+    # Flutter Windows desktop install layout
+    if not os.path.isfile(app_file):
+        app_file = os.path.join(indir, 'data', 'app.so')
+    if not os.path.isfile(app_file):
+        app_file = os.path.join(indir, 'app.so')
+    if not os.path.isfile(app_file):
+        sys.exit("Cannot find libapp/app.so (tried libapp.so, App, data/app.so, app.so)")
+
     flutter_file = os.path.join(indir, 'libflutter.so')
     if not os.path.isfile(flutter_file):
         flutter_file = os.path.join(indir, 'Flutter')
-        if not os.path.isfile(flutter_file):
-            sys.exit("Cannot find libflutter file")
-    
+    if not os.path.isfile(flutter_file):
+        flutter_file = os.path.join(indir, 'flutter_windows.dll')
+    # when indir is .../data, engine sits one level up
+    if not os.path.isfile(flutter_file):
+        flutter_file = os.path.join(os.path.dirname(os.path.abspath(indir)), 'flutter_windows.dll')
+    if not os.path.isfile(flutter_file):
+        sys.exit("Cannot find engine (tried libflutter.so, Flutter, flutter_windows.dll)")
+
     return os.path.abspath(app_file), os.path.abspath(flutter_file)
 
 def extract_libs_from_apk(apk_file: str, out_dir: str):
@@ -140,6 +151,8 @@ def cmake_blutter(input: BlutterInput):
     builddir = os.path.join(BUILD_DIR, input.blutter_name)
     
     macros = find_compat_macro(input.dart_info.version, input.no_analysis)
+    # Select Disassembler/CodeAnalyzer sources (arm64 upstream vs x64 Windows stubs)
+    macros.append(f'-DBLUTTER_ARCH={input.dart_info.arch}')
     my_env = None
     if platform.system() == 'Darwin':
         mac_ver = int(platform.mac_ver()[0].split('.', 1)[0])
@@ -148,11 +161,39 @@ def cmake_blutter(input: BlutterInput):
             clang_file = os.path.join(llvm_path, 'bin', 'clang')
             my_env = {**os.environ, 'CC': clang_file, 'CXX': clang_file+'++'}
     # cmake -GNinja -Bbuild -DCMAKE_BUILD_TYPE=Release
-    subprocess.run([CMAKE_CMD, '-GNinja', '-B', builddir, f'-DDARTLIB={input.dart_info.lib_name}', f'-DNAME_SUFFIX={input.name_suffix}', '-DCMAKE_BUILD_TYPE=Release', '--log-level=NOTICE'] + macros, cwd=blutter_dir, check=True, env=my_env)
-
-    # build and install blutter
-    subprocess.run([NINJA_CMD], cwd=builddir, check=True)
-    subprocess.run([CMAKE_CMD, '--install', '.'], cwd=builddir, check=True)
+    cmake_cmd = [CMAKE_CMD, '-GNinja', '-B', builddir, f'-DDARTLIB={input.dart_info.lib_name}',
+                 f'-DNAME_SUFFIX={input.name_suffix}', '-DCMAKE_BUILD_TYPE=Release',
+                 '--log-level=NOTICE'] + macros
+    if os.name == 'nt':
+        # Full MSVC env (incl. rc/mt/libs) via vcvars; Python often drops parent vcvars PATH.
+        vcvars = None
+        vswhere = os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+                               'Microsoft Visual Studio', 'Installer', 'vswhere.exe')
+        if os.path.isfile(vswhere):
+            inst = subprocess.run(
+                [vswhere, '-latest', '-products', '*',
+                 '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+                 '-property', 'installationPath'],
+                capture_output=True, text=True, check=False,
+            ).stdout.strip()
+            cand = os.path.join(inst, 'VC', 'Auxiliary', 'Build', 'vcvars64.bat') if inst else ''
+            if os.path.isfile(cand):
+                vcvars = cand
+        if not vcvars:
+            vcvars = r'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat'
+        def _run_vs(args, cwd):
+            inner = subprocess.list2cmdline(args)
+            # Fresh vcvars each step so rc/mt/lib paths exist for MSVC link
+            script = f'call "{vcvars}" && {inner}'
+            print('Running under vcvars:', inner)
+            subprocess.run(script, cwd=cwd, check=True, shell=True)
+        _run_vs(cmake_cmd, blutter_dir)
+        _run_vs([NINJA_CMD], builddir)
+        _run_vs([CMAKE_CMD, '--install', '.'], builddir)
+    else:
+        subprocess.run(cmake_cmd, cwd=blutter_dir, check=True, env=my_env)
+        subprocess.run([NINJA_CMD], cwd=builddir, check=True, env=my_env)
+        subprocess.run([CMAKE_CMD, '--install', '.'], cwd=builddir, check=True, env=my_env)
 
 def get_dart_lib_info(libapp_path: str, libflutter_path: str) -> DartLibInfo:
     # getting dart version
@@ -206,45 +247,75 @@ def build_and_run(input: BlutterInput):
             cmake_blutter(input)
             assert os.path.isfile(input.blutter_file), "Build complete but cannot find Blutter binary: " + input.blutter_file
 
-        # execute blutter    
-        subprocess.run([input.blutter_file, '-i', input.libapp_path, '-o', input.outdir], check=True)
+        # execute blutter (ensure bin/ is on PATH for icu/capstone DLLs; Python may reset PATH)
+        run_env = None
+        if os.name == 'nt':
+            bin_dir = os.path.join(SCRIPT_DIR, 'bin')
+            run_env = {k: v for k, v in os.environ.items() if k.lower() != 'path'}
+            run_env['PATH'] = bin_dir + ';' + os.environ.get('PATH', '')
+        subprocess.run([input.blutter_file, '-i', input.libapp_path, '-o', input.outdir], check=True, env=run_env)
 
-def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main_no_flutter(libapp_path: str, dart_version: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, detect_only: bool = False):
     version, os_name, arch = dart_version.split('_')
-    dart_info = DartLibInfo(version, os_name, arch)
-    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
-    build_and_run(input)
-    
-def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
-    dart_info = get_dart_lib_info(libapp_path, libflutter_path)
+    snapshot_hash = None
+    has_compressed_ptrs = None
+    try:
+        from extract_dart_info import extract_snapshot_hash_flags
+        snapshot_hash, flags = extract_snapshot_hash_flags(libapp_path)
+        # flags is a token list; membership avoids 'no-compressed-pointers' false positive
+        has_compressed_ptrs = 'compressed-pointers' in flags
+        print(f'Dart version: {version}, Snapshot: {snapshot_hash}, Target: {os_name} {arch}')
+        print('flags: ' + ' '.join(flags))
+    except Exception as e:
+        print(f'Warning: cannot read snapshot flags ({e}), using defaults')
+    dart_info = DartLibInfo(version, os_name, arch, has_compressed_ptrs, snapshot_hash)
+    if detect_only:
+        print('DETECT_ONLY: ok')
+        print(f'lib_name: {dart_info.lib_name}')
+        print(f'compressed_ptrs: {dart_info.has_compressed_ptrs}')
+        return
     input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
     build_and_run(input)
 
-def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool):
+def main2(libapp_path: str, libflutter_path: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, detect_only: bool = False):
+    dart_info = get_dart_lib_info(libapp_path, libflutter_path)
+    if detect_only:
+        print('DETECT_ONLY: ok')
+        print(f'app: {libapp_path}')
+        print(f'engine: {libflutter_path}')
+        print(f'lib_name: {dart_info.lib_name}')
+        print(f'compressed_ptrs: {dart_info.has_compressed_ptrs}')
+        print(f'blutter_name: blutter_{dart_info.lib_name}' + ('' if dart_info.has_compressed_ptrs else '_no-compressed-ptrs') + ('_no-analysis' if no_analysis else ''))
+        return
+    input = BlutterInput(libapp_path, dart_info, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+    build_and_run(input)
+
+def main(indir: str, outdir: str, rebuild_blutter: bool, create_vs_sln: bool, no_analysis: bool, detect_only: bool = False):
     if indir.endswith(".apk"):
         with tempfile.TemporaryDirectory() as tmp_dir:
             libapp_file, libflutter_file = extract_libs_from_apk(indir, tmp_dir)
-            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+            main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, detect_only)
     else:
         libapp_file, libflutter_file = find_lib_files(indir)
-        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis)
+        main2(libapp_file, libflutter_file, outdir, rebuild_blutter, create_vs_sln, no_analysis, detect_only)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        prog='B(l)utter',
-        description='Reversing a flutter application tool')
+        prog='blutter-windows',
+        description='Flutter RE tool (fork with Windows x64 support) — based on B(l)utter')
     # TODO: accept ipa
-    parser.add_argument('indir', help='An apk or a directory that contains both libapp.so and libflutter.so')
+    parser.add_argument('indir', help='An apk, Android lib dir, or Flutter Windows install dir (contains data/app.so + flutter_windows.dll)')
     parser.add_argument('outdir', help='An output directory')
     parser.add_argument('--rebuild', action='store_true', default=False, help='Force rebuild the Blutter executable')
     parser.add_argument('--vs-sln', action='store_true', default=False, help='Generate Visual Studio solution at <outdir>')
     parser.add_argument('--no-analysis', action='store_true', default=False, help='Do not build with code analysis')
+    parser.add_argument('--detect-only', action='store_true', default=False, help='Only detect dart/os/arch/flags; do not build or dump')
     # rare usage scenario
-    parser.add_argument('--dart-version', help='Run without libflutter (indir become libapp.so) by specify dart version such as "3.4.2_android_arm64"')
+    parser.add_argument('--dart-version', help='Run without libflutter (indir become libapp.so) by specify dart version such as "3.4.2_android_arm64" or "3.3.4_windows_x64"')
     args = parser.parse_args()
 
     if args.dart_version is None:
-        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+        main(args.indir, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.detect_only)
     else:
-        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis)
+        main_no_flutter(args.indir, args.dart_version, args.outdir, args.rebuild, args.vs_sln, args.no_analysis, args.detect_only)

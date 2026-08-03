@@ -265,18 +265,30 @@ void DartDumper::applyStruct4Ida(std::ostream& of)
 					const auto op_count = insn.op_count();
 
 					for (uint8_t j = 0; j < op_count; j++) {
+#if defined(TARGET_ARCH_ARM64)
 						auto reg = ARM64_REG_INVALID;
 						if (insn.ops[j].type == ARM64_OP_REG)
-							reg = insn.ops[j].reg;
+							reg = (arm64_reg)insn.ops[j].reg;
 						else if (insn.ops[j].type == ARM64_OP_MEM)
-							reg = insn.ops[j].mem.base;
-						if (reg == CSREG_DART_THR) {
+							reg = (arm64_reg)insn.ops[j].mem.base;
+						const bool isThr = (reg == CSREG_DART_THR);
+						const bool isPp = (reg == CSREG_DART_PP);
+#elif defined(TARGET_ARCH_X64)
+						if (insn.ops[j].type != X86_OP_MEM)
+							continue;
+						const auto base = (x86_reg)insn.ops[j].mem.base;
+						const bool isThr = IsCsDartThr(base);
+						const bool isPp = IsCsDartPp(base);
+#else
+						const bool isThr = false;
+						const bool isPp = false;
+#endif
+						if (isThr) {
 							of << "ida_ua.decode_insn(insn, " << insn.address() << ")\n";
 							of << "idc.op_stroff(insn, " << (int)j << ", thrs, 0)\n";
 							break;
 						}
-						else if (reg == CSREG_DART_PP) {
-							// TODO: if it is not MEM operand, reg cannot be struct offset
+						else if (isPp) {
 							of << "ida_ua.decode_insn(insn, " << insn.address() << ")\n";
 							of << "idc.op_stroff(insn, " << (int)j << ", pps, 0)\n";
 							break;
@@ -333,6 +345,7 @@ void DartDumper::DumpCode(const char* out_dir)
 					auto& asmTexts = dartFn->GetAnalyzedData()->asmTexts.Data();
 					auto& il_insns = dartFn->GetAnalyzedData()->il_insns;
 					auto il_itr = il_insns.begin();
+					const auto il_end = il_insns.end();
 					AddrRange range;
 					ASSERT(!asmTexts.empty());
 					for (auto& asmText : asmTexts) {
@@ -366,15 +379,15 @@ void DartDumper::DumpCode(const char* out_dir)
 						if (range.Has(asmText.addr)) {
 							of << "    ";
 						}
-						else {
-							while ((*il_itr)->Start() < asmText.addr) {
+						else if (il_itr != il_end) {
+							while (il_itr != il_end && (*il_itr)->Start() < asmText.addr) {
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
 									of << std::format("{:#x}: {}\n", (*il_itr)->Start(), (*il_itr)->ToString());
 									of << "    // ";
 								}
 								++il_itr;
 							}
-							if ((*il_itr)->Start() == asmText.addr) {
+							if (il_itr != il_end && (*il_itr)->Start() == asmText.addr) {
 								if ((*il_itr)->Kind() != ILInstr::Unknown) {
 									of << std::format("{:#x}: {}\n", asmText.addr, (*il_itr)->ToString());
 									of << "    //     ";

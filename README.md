@@ -1,11 +1,18 @@
-# B(l)utter
-Flutter Mobile Application Reverse Engineering Tool by Compiling Dart AOT Runtime
+# blutter-windows
 
-Currently the application supports only Android libapp.so (arm64 only).
-Also the application is currently work only against recent Dart versions.
+Fork of [worawit/blutter](https://github.com/worawit/blutter) with **Flutter Windows (x64)** support.
 
-For high priority missing features, see [TODO](#todo)
+Blutter reverse-engineers Flutter apps by compiling a matching Dart AOT runtime and loading the snapshot (`libapp.so` / `app.so`).
 
+| Target | Upstream | This fork |
+|--------|----------|-----------|
+| Android `libapp.so` (arm64) | Yes | Yes (kept compatible) |
+| Flutter Windows (`data/app.so` + `flutter_windows.dll`, x64) | No | **Yes (MVP)** |
+
+Windows MVP: detect → build `windows/x64` Dart VM → dump Object Pool → asm comments + IDA rename scripts.  
+Full x64 IL (parity with arm64) is not ported yet. See `work/steps/README.md` for the port checklist.
+
+Works against recent Dart versions only. High-priority gaps: [TODO](#todo).
 
 ## Environment Setup
 This application uses C++20 Formatting library. It requires very recent C++ compiler such as g++>=13, Clang>=16.
@@ -49,13 +56,24 @@ pip3 install pyelftools requests
 ```
 
 ## Usage
+
+### Android
 Extract "lib" directory from apk file
 ```
 python3 blutter.py path/to/app/lib/arm64-v8a out_dir
 ```
-The blutter.py will automatically detect the Dart version from the flutter engine and call executable of blutter to get the information from libapp.so.
 
-If the blutter executable for required Dart version does not exists, the script will automatically checkout Dart source code and compiling it.
+### Flutter Windows
+Point at the app install directory (contains `flutter_windows.dll` and `data/app.so`):
+```
+python blutter.py path\to\flutter_app out_dir
+```
+Detect only (no build):
+```
+python blutter.py path\to\flutter_app out_dir --detect-only
+```
+
+The script detects the Dart version from the Flutter engine, builds `blutter` for that VM if needed, then dumps info from the AOT snapshot.
 
 ## Update
 You can use ```git pull``` to update and run blutter.py with ```--rebuild``` option to force rebuild the executable
@@ -68,6 +86,7 @@ python3 blutter.py path/to/app/lib/arm64-v8a out_dir --rebuild
 - **blutter_frida.js** the frida script template for the target application
 - **objs.txt** complete (nested) dump of Object from Object Pool
 - **pp.txt** all Dart objects in Object Pool
+- **ida_script/** IDA rename / struct helper scripts
 
 
 ## Directories
@@ -78,6 +97,7 @@ python3 blutter.py path/to/app/lib/arm64-v8a out_dir --rebuild
 - **external** contains 3rd party libraries for Windows only
 - **packages** contains the static libraries of Dart Runtime
 - **scripts** contains python scripts for getting/building Dart
+- **work/steps** Windows/x64 port notes (this fork)
 
 
 ## Generating Visual Studio Solution for Development
@@ -86,7 +106,11 @@ I use Visual Studio to delevlop Blutter on Windows. ```--vs-sln``` options can b
 python blutter.py path\to\lib\arm64-v8a build\vs --vs-sln
 ```
 
+## Credit
+Original project: [worawit/blutter](https://github.com/worawit/blutter) (MIT).
+
 ## TODO
+- x64 IL analysis (parity with arm64 `asm2il`)
 - More code analysis
   - Function arguments and return type
   - Some psuedo code for code pattern

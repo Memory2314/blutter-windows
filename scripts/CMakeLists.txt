@@ -26,8 +26,8 @@ string(SUBSTRING ${PROJECT_NAME} 6 -1 DART_VERSION)
 if (NOT DEFINED TARGET_OS)
 	set(TARGET_OS "android")
 endif()
-if (NOT "${TARGET_OS}" MATCHES "^(android|ios)$")
-	message(FATAL_ERROR "Only android or ios platform")
+if (NOT "${TARGET_OS}" MATCHES "^(android|ios|windows)$")
+	message(FATAL_ERROR "Only android, ios or windows platform")
 endif()
 
 if (NOT DEFINED TARGET_ARCH)
@@ -54,11 +54,13 @@ set_target_properties(${LIBNAME} PROPERTIES
 	VISIBILITY_INLINES_HIDDEN ON
 	POSITION_INDEPENDENT_CODE ON)
 
-# DART_TARGET_OS_ANDROID or DART_TARGET_OS_MACOS_IOS
+# DART_TARGET_OS_ANDROID / DART_TARGET_OS_MACOS_IOS / DART_TARGET_OS_WINDOWS
 if (${TARGET_OS} STREQUAL "android")
 	set(target_os "DART_TARGET_OS_ANDROID")
 	# Note: DART_COMPRESSED_POINTERS should be from the binary
 	#set(dart_pointers "DART_COMPRESSED_POINTERS")
+elseif (${TARGET_OS} STREQUAL "windows")
+	set(target_os "DART_TARGET_OS_WINDOWS")
 else()
 	set(target_os "DART_TARGET_OS_MACOS_IOS")
 endif()
@@ -81,6 +83,7 @@ set(defines ${target_arch} ${target_os}
 	PRODUCT U_USING_ICU_NAMESPACE=0
 	_HAS_EXCEPTIONS=0 DART_TARGET_OS_WINDOWS_UWP
 )
+message(STATUS "dartvm TARGET_OS=${TARGET_OS} TARGET_ARCH=${TARGET_ARCH} COMPRESSED_PTRS=${COMPRESSED_PTRS}")
 # Dart header can detect DART_HOST_OS_xxx value
 
 if (MSVC)

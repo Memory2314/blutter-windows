@@ -19,7 +19,14 @@ SDK_DIR = os.path.join(SCRIPT_DIR, 'dartsdk')
 BUILD_DIR = os.path.join(SCRIPT_DIR, 'build')
 
 #DART_GIT_URL = 'https://dart.googlesource.com/sdk.git'
-DART_GIT_URL = 'https://github.com/dart-lang/sdk.git'
+# Direct github.com often resets in this environment; prefer mirror, fallback in checkout_dart.
+DART_GIT_URL = os.environ.get('BLUTTER_DART_GIT_URL', 'https://ghproxy.net/https://github.com/dart-lang/sdk.git')
+DART_GIT_URL_FALLBACKS = [
+    DART_GIT_URL,
+    'https://gitclone.com/github.com/dart-lang/sdk.git',
+    'https://github.com/dart-lang/sdk.git',
+    'https://dart.googlesource.com/sdk.git',
+]
 
 imp_replace_snippet = """import importlib.util
 import importlib.machinery
@@ -47,25 +54,174 @@ class DartLibInfo:
         self.lib_name = f'dartvm{version}_{os_name}_{arch}'
 
 
+def _rmtree(path):
+    def remove_readonly(func, p, _):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    shutil.rmtree(path, onerror=remove_readonly)
+
+
+def _download_file(url: str, dest: str, min_bytes: int = 1_000_000):
+    """Download with curl resume when available; fall back to urllib."""
+    import urllib.request
+
+    # Prefer curl: better resume / progress on flaky links
+    curl = shutil.which('curl')
+    if curl:
+        # -C - resume; -L follow redirects; --retry on transient errors
+        cmd = [
+            curl, '-L', '--fail', '--retry', '5', '--retry-delay', '2',
+            '-C', '-', '-o', dest, url,
+        ]
+        print(' ', ' '.join(cmd))
+        subprocess.run(cmd, check=True)
+    else:
+        urllib.request.urlretrieve(url, dest)
+    size = os.path.getsize(dest) if os.path.exists(dest) else 0
+    if size < min_bytes:
+        raise RuntimeError(f'archive too small: {size} bytes from {url}')
+
+
+def _checkout_dart_from_zip(info: DartLibInfo, clonedir: str):
+    """Fallback when git sparse fetch is unstable: download tag archive and keep needed trees."""
+    import zipfile
+    import tempfile
+
+    zip_urls = [
+        f'https://codeload.github.com/dart-lang/sdk/zip/refs/tags/{info.version}',
+        f'https://ghproxy.net/https://github.com/dart-lang/sdk/archive/refs/tags/{info.version}.zip',
+        f'https://github.com/dart-lang/sdk/archive/refs/tags/{info.version}.zip',
+    ]
+    keep_prefixes = (
+        'runtime/',
+        'tools/',
+        'third_party/double-conversion/',
+    )
+    # Keep cache under dartsdk/ so interrupted downloads can resume next run
+    os.makedirs(SDK_DIR, exist_ok=True)
+    zip_path = os.path.join(SDK_DIR, f'sdk-{info.version}.zip')
+
+    def _zip_looks_valid(path: str) -> bool:
+        try:
+            with zipfile.ZipFile(path, 'r') as zf:
+                names = zf.namelist()
+                if not names:
+                    return False
+                root = names[0].split('/', 1)[0]
+                return info.version in root
+        except Exception:
+            return False
+
+    last_err = None
+    if _zip_looks_valid(zip_path):
+        print(f'Reusing cached Dart SDK archive {zip_path}')
+    else:
+        for url in zip_urls:
+            print(f'Downloading Dart SDK archive from {url}')
+            try:
+                _download_file(url, zip_path)
+                if not _zip_looks_valid(zip_path):
+                    raise RuntimeError('downloaded zip failed validation')
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                print(f'Archive download failed: {e}')
+                # keep partial file for curl -C resume; wipe only if not a valid zip
+                if os.path.exists(zip_path) and not _zip_looks_valid(zip_path):
+                    # still keep partial for resume unless empty
+                    if os.path.getsize(zip_path) == 0:
+                        os.remove(zip_path)
+        if last_err is not None and not _zip_looks_valid(zip_path):
+            raise last_err
+
+    print(f'Extracting needed paths from {zip_path}')
+    os.makedirs(clonedir, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        # github zip root is like sdk-3.3.4/
+        names = zf.namelist()
+        root = names[0].split('/', 1)[0] + '/'
+        extracted = 0
+        for name in names:
+            if not name.startswith(root) or name.endswith('/'):
+                continue
+            rel = name[len(root):]
+            if not rel.startswith(keep_prefixes):
+                continue
+            dest = os.path.join(clonedir, rel.replace('/', os.sep))
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with zf.open(name) as src, open(dest, 'wb') as dst:
+                shutil.copyfileobj(src, dst)
+            extracted += 1
+            if extracted % 500 == 0:
+                print(f'  extracted {extracted} files...')
+        print(f'  extracted {extracted} files total')
+    # keep zip_path under dartsdk/ as cache for rebuilds
+
+
 def checkout_dart(info: DartLibInfo):
     clonedir = os.path.join(SDK_DIR, 'v'+info.version)
 
     # if no version file,assume previous clone is failed. delete the whole directory and try again.
     version_file = os.path.join(clonedir, 'runtime', 'vm', 'version.cc')
-    if os.path.exists(clonedir) and not os.path.exists(version_file):
+    version_in_file = os.path.join(clonedir, 'runtime', 'vm', 'version_in.cc')
+    if os.path.exists(clonedir) and not (os.path.exists(version_file) or os.path.exists(version_in_file)):
         print('Delete incomplete clone directory ' + clonedir)
-        def remove_readonly(func, path, _):
-            os.chmod(path, stat.S_IWRITE)
-            func(path)
-        shutil.rmtree(clonedir, onerror=remove_readonly)
+        _rmtree(clonedir)
     
     # clone Dart source code
     if not os.path.exists(clonedir):
-        # minimum clone repository at the target branch
-        subprocess.run([GIT_CMD, '-c', 'advice.detachedHead=false', 'clone', '-b', info.version, '--depth', '1', '--filter=blob:none', '--sparse', '--progress', DART_GIT_URL, clonedir], check=True)
-        # checkout only needed sources (runtime and tools)
-        # since Dart 3.3 "third_party/double-conversion" is moved to outside of "runtime" directory
-        subprocess.run([GIT_CMD, 'sparse-checkout', 'set', 'runtime', 'tools', 'third_party/double-conversion'], cwd=clonedir, check=True)
+        # Default zip-first: git sparse clone is unreliable on flaky links.
+        prefer_zip = os.environ.get('BLUTTER_DART_PREFER_ZIP', '1').strip().lower() not in ('0', 'false', 'no')
+        last_err = None
+        print(f'BLUTTER_DART_PREFER_ZIP={os.environ.get("BLUTTER_DART_PREFER_ZIP", "<unset>")} -> prefer_zip={prefer_zip}')
+        if prefer_zip:
+            try:
+                print('Prefer zip archive for Dart SDK (set BLUTTER_DART_PREFER_ZIP=0 to force git)')
+                _checkout_dart_from_zip(info, clonedir)
+            except Exception as e:
+                last_err = e
+                print(f'Zip checkout failed: {e}')
+                if os.path.exists(clonedir):
+                    _rmtree(clonedir)
+
+        if not os.path.exists(clonedir):
+            for git_url in DART_GIT_URL_FALLBACKS:
+                print(f'Cloning Dart SDK {info.version} from {git_url}')
+                try:
+                    # avoid --filter=blob:none: promisor fetches often reset on unstable links
+                    subprocess.run(
+                        [GIT_CMD, '-c', 'advice.detachedHead=false', 'clone', '-b', info.version,
+                         '--depth', '1', '--sparse', '--progress', git_url, clonedir],
+                        check=True,
+                    )
+                    # checkout only needed sources (runtime and tools)
+                    # since Dart 3.3 "third_party/double-conversion" is moved to outside of "runtime" directory
+                    ok = False
+                    for attempt in range(1, 4):
+                        try:
+                            print(f'sparse-checkout attempt {attempt}/3')
+                            subprocess.run(
+                                [GIT_CMD, 'sparse-checkout', 'set', 'runtime', 'tools', 'third_party/double-conversion'],
+                                cwd=clonedir, check=True,
+                            )
+                            ok = True
+                            break
+                        except subprocess.CalledProcessError as e:
+                            print(f'sparse-checkout failed: {e}')
+                            last_err = e
+                    if not ok:
+                        raise last_err
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    print(f'Clone failed from {git_url}: {e}')
+                    if os.path.exists(clonedir):
+                        _rmtree(clonedir)
+            if last_err is not None and not os.path.exists(clonedir):
+                raise last_err
+
         # delete some unnecessary files
         with os.scandir(clonedir) as it:
             for entry in it:

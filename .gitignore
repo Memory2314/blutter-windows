@@ -6,6 +6,9 @@ out/
 dartsdk/
 external/
 packages/
+# local analysis dumps (keep work/steps/*.md)
+work/out*/
+work/out_*/
 # python
 __pycache__/
 *.py[cod]
