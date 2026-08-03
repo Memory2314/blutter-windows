@@ -9,6 +9,8 @@ packages/
 # local analysis dumps (keep work/steps/*.md)
 work/out*/
 work/out_*/
+# packaged release artifacts (upload via GitHub Releases)
+release/
 # python
 __pycache__/
 *.py[cod]
