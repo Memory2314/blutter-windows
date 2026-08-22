@@ -86,8 +86,114 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 {
 	std::filesystem::create_directory(outDir);
 	std::ofstream of((outDir / "addNames.py").string());
-	of << "import ida_funcs\n";
-	of << "import idaapi\n\n";
+	of << R"PYTHON(import ida_auto
+import ida_bytes
+import ida_funcs as _ida_funcs
+import ida_idaapi
+import ida_kernwin
+import ida_name
+import ida_typeinf
+import os
+
+
+class _Progress:
+	def __init__(self):
+		self.counts = {}
+		self.cancelled = False
+		self.name_failures = 0
+		self.function_skips = 0
+		self.comment_misses = 0
+		self.comment_failures = 0
+		self.comments_truncated = 0
+		self.offset_failures = 0
+		ida_kernwin.show_wait_box("NODELAY\nBlutter symbols: starting...")
+
+	def update(self, stage, total=None, every=1000, cancellable=True):
+		current = self.counts.get(stage, 0) + 1
+		self.counts[stage] = current
+		if current == 1 or current % every == 0 or current == total:
+			if total:
+				percent = current * 100 // total
+				value = f"{current:,} / {total:,} ({percent}%)"
+			else:
+				value = f"{current:,} processed"
+			ida_kernwin.replace_wait_box(
+				f"Blutter symbols: {stage}\n{value}\nPress Cancel to stop"
+			)
+			if cancellable and ida_kernwin.user_cancelled():
+				self.cancelled = True
+
+	def close(self):
+		ida_kernwin.hide_wait_box()
+
+
+progress = _Progress()
+
+
+def _fatal(message):
+	progress.close()
+	raise RuntimeError(message)
+
+
+class _IdaFuncsCompat:
+	@staticmethod
+	def add_func(start_ea, end_ea=ida_idaapi.BADADDR):
+		func = _ida_funcs.get_func(start_ea)
+		if func is not None and func.start_ea == start_ea:
+			progress.function_skips += 1
+			return True
+		return _ida_funcs.add_func(start_ea, end_ea)
+
+
+class _IdaApiCompat:
+	idc_parse_types = staticmethod(ida_typeinf.idc_parse_types)
+
+	@staticmethod
+	def set_name(ea, name):
+		progress.update("Naming")
+		if progress.cancelled:
+			return False
+		if ida_name.get_name(ea) == name:
+			return True
+		ok = ida_name.set_name(ea, name, ida_name.SN_NOWARN)
+		if not ok:
+			progress.name_failures += 1
+		return ok
+
+
+class _IdcCompat:
+	BADADDR = ida_idaapi.BADADDR
+	PT_FILE = ida_typeinf.PT_FILE
+
+	def __init__(self):
+		self.offset_count = 0
+
+	@staticmethod
+	def get_struc_id(name):
+		return ida_typeinf.get_named_type_tid(name)
+
+	@staticmethod
+	def import_type(_idx, name):
+		return ida_typeinf.get_named_type_tid(name)
+
+	def op_stroff(self, insn, operand, struct_tid, delta):
+		self.offset_count += 1
+		progress.update("Applying structure offsets", every=250)
+		if progress.cancelled:
+			return False
+		ok = ida_bytes.op_stroff(insn, operand, [struct_tid], delta)
+		if not ok:
+			progress.offset_failures += 1
+		return ok
+
+
+ida_funcs = _IdaFuncsCompat()
+idaapi = _IdaApiCompat()
+idc = _IdcCompat()
+
+ida_auto.auto_wait()
+
+)PYTHON";
 
 	for (auto lib : app.libs) {
 		std::string lib_prefix = lib->GetName();
@@ -133,29 +239,131 @@ void DartDumper::Dump4Ida(std::filesystem::path outDir)
 	// Note: create struct with a lot of member by ida script is very slow
 	//   use header file then adding comment is much faster
 	auto comments = DumpStructHeaderFile((outDir / "ida_dart_struct.h").string());
-	of << R"CBLOCK(
-import ida_struct
-import os
+	of << "\nCOMMENT_TOTAL = " << comments.size() << "\n";
+	of << R"PYTHON(
+class _StructEdit:
+	def __init__(self, name, tif):
+		self.name = name
+		self.tif = tif
+		udt = ida_typeinf.udt_type_data_t()
+		if not tif.get_udt_details(udt):
+			_fatal(f"Unable to read structure members for {name}")
+		self.members_by_offset = {
+			udt[idx].offset // 8: idx for idx in range(udt.size())
+		}
+		self.comments = []
+
+
+class _IdaStructCompat:
+	def __init__(self):
+		self.comment_count = 0
+
+	@staticmethod
+	def get_struc(struct_tid):
+		name = ida_typeinf.get_tid_name(struct_tid)
+		tif = ida_typeinf.tinfo_t()
+		if not name or not tif.get_named_type(None, name) or not tif.is_struct():
+			return None
+		return _StructEdit(name, tif)
+
+	@staticmethod
+	def get_member(edit, byte_offset):
+		if edit is None:
+			return None
+		idx = edit.members_by_offset.get(byte_offset)
+		return (edit, idx) if idx is not None else None
+
+	def set_member_cmt(self, member, comment, repeatable):
+		self.comment_count += 1
+		progress.update("Preparing structure comments", COMMENT_TOTAL)
+		if progress.cancelled:
+			return False
+		if member is None:
+			progress.comment_misses += 1
+			return False
+		edit, idx = member
+		edit.comments.append((idx, self._safe_comment(comment), not repeatable))
+		return True
+
+	@staticmethod
+	def _safe_comment(comment):
+		clean = "".join(
+			ch if ord(ch) >= 32 or ch in "\n\r\t" else f"\\x{ord(ch):02x}"
+			for ch in comment
+		)
+		data = clean.encode("utf-8")
+		if len(data) <= 4096:
+			return clean
+		progress.comments_truncated += 1
+		return data[:4050].decode("utf-8", "ignore") + "\n...[truncated by IDA 9.4 adapter]"
+
+	@staticmethod
+	def commit(edit):
+		if progress.cancelled or not edit.comments:
+			return not progress.cancelled
+		ida_typeinf.begin_type_updating(ida_typeinf.UTP_STRUCT)
+		try:
+			last = len(edit.comments) - 1
+			for pos, (idx, comment, is_regular) in enumerate(edit.comments):
+				progress.update(
+					"Saving structure comments", len(edit.comments),
+					1000, cancellable=False
+				)
+				flags = 0 if pos == last else ida_typeinf.ETF_NO_SAVE
+				result = edit.tif.set_udm_cmt(idx, comment, is_regular, flags)
+				if result != ida_typeinf.TERR_OK:
+					progress.comment_failures += 1
+					if pos == last:
+						_fatal(
+							f"Unable to save {edit.name}: "
+							f"{ida_typeinf.tinfo_errstr(result)} ({result})"
+						)
+		finally:
+			ida_typeinf.end_type_updating(ida_typeinf.UTP_STRUCT)
+		return True
+
+
+ida_struct = _IdaStructCompat()
+
+
 def create_Dart_structs():
 	sid1 = idc.get_struc_id("DartThread")
-	if sid1 != idc.BADADDR:
-		return sid1, idc.get_struc_id("DartObjectPool")
-	hdr_file = os.path.join(os.path.dirname(__file__), 'ida_dart_struct.h')
-	idaapi.idc_parse_types(hdr_file, idc.PT_FILE)
-	sid1 = idc.import_type(-1, "DartThread")
-	sid2 = idc.import_type(-1, "DartObjectPool")
+	sid2 = idc.get_struc_id("DartObjectPool")
+	if sid1 == idc.BADADDR or sid2 == idc.BADADDR:
+		hdr_file = os.path.join(os.path.dirname(__file__), 'ida_dart_struct.h')
+		parse_errors = idaapi.idc_parse_types(hdr_file, idc.PT_FILE)
+		if parse_errors:
+			_fatal(f"Failed to parse {hdr_file}: {parse_errors} error(s)")
+		sid1 = idc.import_type(-1, "DartThread")
+		sid2 = idc.import_type(-1, "DartObjectPool")
+	if sid1 == idc.BADADDR or sid2 == idc.BADADDR:
+		_fatal("DartThread or DartObjectPool was not added to Local Types")
 	struc = ida_struct.get_struc(sid2)
-)CBLOCK";
+	if struc is None:
+		_fatal("DartObjectPool is not a structure type")
+)PYTHON";
 	for (const auto& [offset, comment] : comments) {
 		of << "\tida_struct.set_member_cmt(ida_struct.get_member(struc, " << offset << "), '''" << comment << "''', True)\n";
 	}
-	of << "\treturn sid1, sid2\n";
+	of << "\tida_struct.commit(struc)\n";
+	of << "\treturn idc.get_struc_id(\"DartThread\"), idc.get_struc_id(\"DartObjectPool\")\n";
 	of << "thrs, pps = create_Dart_structs()\n";
 
 	of << "print('Applying Thread and Object Pool struct')\n";
 	applyStruct4Ida(of);
 
-	of << "print('Script finished!')\n";
+	of << R"PYTHON(progress.close()
+print(
+	"Blutter summary: "
+	f"name failures={progress.name_failures}, "
+	f"existing functions skipped={progress.function_skips}, "
+	f"missing comment members={progress.comment_misses}, "
+	f"comment update failures={progress.comment_failures}, "
+	f"long comments truncated={progress.comments_truncated}, "
+	f"offset failures={progress.offset_failures}"
+)
+print('Script cancelled.' if progress.cancelled else 'Script finished!')
+)PYTHON";
 }
 
 std::vector<std::pair<intptr_t, std::string>> DartDumper::DumpStructHeaderFile(std::string outFile)
